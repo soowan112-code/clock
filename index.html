@@ -1,0 +1,879 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Clock Room · AR</title>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+    }
+  }
+  </script>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: #000;
+      overflow: hidden;
+      font-family: sans-serif;
+    }
+
+    #container {
+      width: 100vw;
+      height: 100dvh;
+      position: relative;
+    }
+
+    #status {
+      position: fixed;
+      top: 15px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      padding: 10px 16px;
+      color: white;
+      background: #222c;
+      border-radius: 20px;
+      font-size: 13px;
+      white-space: nowrap;
+      pointer-events: none;
+    }
+
+    #touchArea {
+      position: fixed;
+      inset: 0;
+      z-index: 5;
+      touch-action: none;
+      background: transparent;
+    }
+
+    #startButton {
+      display: none;
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 20;
+      padding: 16px 26px;
+      border: 0;
+      border-radius: 12px;
+      background: white;
+      font-size: 17px;
+    }
+
+    #soundButton {
+      display: none;
+      position: fixed;
+      top: max(12px, env(safe-area-inset-top));
+      right: 12px;
+      z-index: 16;
+      padding: 10px 18px;
+      border: 0;
+      border-radius: 20px;
+      background: white;
+      color: #222;
+      font-size: 14px;
+      font-weight: bold;
+      touch-action: manipulation;
+    }
+
+  </style>
+</head>
+
+<body>
+
+  <div id="container"></div>
+  <div id="touchArea"></div>
+
+  <div id="status" role="status">AR 준비 중...</div>
+
+  <button id="startButton">카메라 시작</button>
+  <button id="soundButton">소리 켜기</button>
+
+  <script type="module">
+
+    import * as THREE from "three";
+    import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+    import { MindARThree } from "mindar-image-three";
+
+    const status = document.getElementById("status");
+    const startButton = document.getElementById("startButton");
+    const soundButton = document.getElementById("soundButton");
+    const touchArea = document.getElementById("touchArea");
+
+
+    // AR 초기 설정
+    const mindarThree = new MindARThree({
+      container: document.querySelector("#container"),
+      imageTargetSrc: "./targets.mind",
+      maxTrack: 1
+    });
+
+    const { renderer, scene, camera } = mindarThree;
+    const anchor = mindarThree.addAnchor(0);
+
+    // 전화기와 영상의 이동·회전·크기를 따로 조작합니다.
+    const modelMoveGroup = new THREE.Group();
+    const backgroundMoveGroup = new THREE.Group();
+    const phoneShakeGroup = new THREE.Group();
+    modelMoveGroup.add(phoneShakeGroup);
+    anchor.group.add(modelMoveGroup);
+    anchor.group.add(backgroundMoveGroup);
+
+
+    // 조명
+    scene.add(
+      new THREE.HemisphereLight(0xffffff, 0x444444, 1.5)
+    ); 
+    // 환경라이트, 수치가 밝기
+    const directionalLight = new THREE.DirectionalLight(
+      0xffffff, 2
+    );
+    
+    directionalLight.position.set(1, 2, 3);
+    scene.add(directionalLight);
+
+    // MP4는 포스터 전체입니다. 추적 타겟에 해당하는 상단 영역만 벽에 겹칩니다.
+    const VIDEO_FILE = "./clock-room-poster.mp4";
+    const MODEL_FILE = "./phone.glb";
+    const POSTER_WIDTH = 1054;
+    const POSTER_HEIGHT = 1492;
+    const TARGET_HEIGHT = 1364;
+    const PHONE_SIZE = 0.43;
+    // 배포된 phone.glb의 수화기와 줄 윗부분 정점 범위입니다.
+    const HANDSET_RANGES = [[32932, 33465], [37941, 38098], [39294, 39296]];
+    const CORD_RANGES = [
+      [22873, 22876], [22906, 22915], [22939, 22952], [22973, 22989],
+      [23006, 23026], [23040, 23063], [23076, 23100], [23110, 23137],
+      [23144, 32435], [37569, 37873], [39276, 39285], [39486, 39526], [39775, 39780]
+    ];
+    let handsetRig = null;
+    let handsetDeformed = false;
+    let phonePlaced = false;
+    let ringStartedAt = -Infinity;
+    let audioContext = null;
+
+    let modelRoot = null;
+    let initialFitScale = 1;
+    let modelFailed = false;
+    let videoReady = false;
+    let videoFailed = false;
+    let soundEnabled = false;
+    let backgroundMesh = null;
+    let targetVisible = false;
+    let started = false;
+    let starting = false;
+
+    const loader = new GLTFLoader();
+
+
+    const video = document.createElement("video");
+    video.src = VIDEO_FILE;
+    video.loop = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+
+    function updateStatus() {
+      if (!started) return;
+      if (!targetVisible) {
+        status.textContent = "포스터를 카메라에 비춰주세요";
+      } else if (videoFailed || modelFailed) {
+        status.textContent = videoFailed ? "시계 영상을 불러올 수 없어요" : "전화기 모델을 불러올 수 없어요";
+      } else {
+        status.textContent = modelRoot ? "전화기를 툭 쳐보세요" : "";
+      }
+      status.hidden = !status.textContent;
+    }
+
+    function updateSoundButton() {
+      soundButton.style.display = targetVisible && videoReady && !videoFailed ? "block" : "none";
+      soundButton.textContent = soundEnabled ? "시계 소리 끄기" : "시계 소리 켜기";
+    }
+
+    function playBackgroundVideo() {
+      if (!targetVisible || !videoReady || videoFailed) return;
+      video.play().catch((error) => {
+        if (error.name === "NotAllowedError" && !video.muted) {
+          soundEnabled = false;
+          video.muted = true;
+          updateSoundButton();
+          video.play().catch(() => {});
+        } else if (error.name !== "AbortError") {
+          updateSoundButton();
+        }
+      });
+    }
+
+    video.addEventListener("loadedmetadata", () => {
+      if (videoReady || videoFailed) return;
+      const texture = new THREE.VideoTexture(video);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.repeat.y = TARGET_HEIGHT / POSTER_HEIGHT;
+      texture.offset.y = 1 - texture.repeat.y;
+      const material = new THREE.MeshBasicMaterial({ map: texture, toneMapped: false });
+      backgroundMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, TARGET_HEIGHT / POSTER_WIDTH), material);
+      backgroundMesh.visible = video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
+      backgroundMoveGroup.add(backgroundMesh);
+      videoReady = true;
+      updateSoundButton();
+      playBackgroundVideo();
+    });
+
+    video.addEventListener("loadeddata", () => {
+      if (backgroundMesh) backgroundMesh.visible = true;
+    });
+    video.addEventListener("error", () => {
+      videoFailed = true;
+      if (backgroundMesh) backgroundMesh.visible = false;
+      updateSoundButton();
+      updateStatus();
+    });
+    soundButton.addEventListener("click", () => {
+      soundEnabled = !soundEnabled;
+      video.muted = !soundEnabled;
+      updateSoundButton();
+      playBackgroundVideo();
+    });
+    video.load();
+
+    // GLB 3D 모델 로딩
+    loader.load(
+
+      MODEL_FILE,
+
+      (gltf) => {
+
+        const model = gltf.scene;
+
+        const box = new THREE.Box3().setFromObject(model);
+
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+
+        box.getSize(size);
+        box.getCenter(center);
+
+        const maxDimension = Math.max(
+          size.x,
+          size.y,
+          size.z
+        );
+
+        if (!Number.isFinite(maxDimension) || maxDimension <= 0) {
+          modelFailed = true;
+          updateStatus();
+          return;
+        }
+
+        initialFitScale = PHONE_SIZE / maxDimension;
+
+        // 모델의 가운데를 기준으로 배치
+        model.position.set(
+          -center.x,
+          -center.y,
+          -center.z
+        );
+
+        // 크기 및 회전 조작 그룹
+        modelRoot = new THREE.Group();
+
+        modelRoot.scale.setScalar(initialFitScale);
+        const presentation = new THREE.Group();
+        presentation.add(model);
+        handsetRig = bindHandset(model);
+        if (handsetRig) {
+          // 버튼 배열의 깊이 방향(+X에 가깝고 Z가 약간 음수)에서 위로 30° 올려 봅니다.
+          const elevatedFront = new THREE.Vector3(0.8633, 0.5, -0.0693);
+          const frontMatrix = new THREE.Matrix4().lookAt(elevatedFront, new THREE.Vector3(), phoneUp);
+          presentation.quaternion.setFromRotationMatrix(frontMatrix).invert();
+        }
+        modelRoot.add(presentation);
+
+        phoneShakeGroup.add(modelRoot);
+        updateStatus();
+
+      },
+
+      undefined,
+
+      (error) => {
+        modelFailed = true;
+        updateStatus();
+        console.error("전화기 모델 로딩 실패:", error);
+      }
+
+    );
+
+
+    anchor.onTargetFound = () => {
+      targetVisible = true;
+      updateSoundButton();
+      playBackgroundVideo();
+      updateStatus();
+    };
+
+    anchor.onTargetLost = () => {
+      targetVisible = false;
+      video.pause();
+      ringStartedAt = -Infinity;
+      activePointers.clear();
+      tapCandidate = false;
+      singleStartTarget = null;
+      dragHasPrev = false;
+      dragTargetGroup = null;
+      pinchStartDistance = 0;
+      updateSoundButton();
+      updateStatus();
+    };
+
+
+    // 카메라 시작
+    async function startAR() {
+
+      if (started || starting) return;
+
+      starting = true;
+
+      status.hidden = false;
+      status.textContent = "카메라 권한 확인 중...";
+      startButton.style.display = "none";
+
+      try {
+
+        await mindarThree.start();
+
+        started = true;
+        starting = false;
+
+        renderer.setAnimationLoop((now) => {
+          if (targetVisible && !phonePlaced) placePhoneInView();
+          updatePhoneShake(now);
+          renderer.render(scene, camera);
+        });
+
+        updateStatus();
+
+      } catch (error) {
+
+        console.error("AR 시작 오류:", error);
+
+        starting = false;
+
+        status.textContent = "카메라 권한과 마커 파일을 확인해주세요";
+        startButton.style.display = "block";
+
+      }
+
+    }
+
+    startButton.addEventListener("click", startAR);
+
+
+    // 한 손가락 회전
+   // 두 손가락 확대 / 축소 + 위치 이동
+    const activePointers = new Map();
+
+    let previousX = 0;
+    let previousY = 0;
+
+    let pinchStartDistance = 0;
+    let pinchStartScale = 1;
+
+    const ROTATION_SPEED = 0.01;
+
+    // 전화기 탭 판정 기준
+    const TAP_MOVE_LIMIT = 10;   // px: 이 이상 움직이면 탭이 아님
+    const TAP_MAX_TIME = 400;    // ms: 이 시간 안에 손을 떼야 탭
+
+    // 한 손가락 터치 상태
+    let singleStartTarget = null;   // 터치 시작 지점의 대상 ("model" / "background" / null)
+    let tapCandidate = false;
+    let tapStartX = 0;
+    let tapStartY = 0;
+    let tapStartTime = 0;
+
+    function getPinchDistance() {
+
+      const points = Array.from(activePointers.values());
+
+      if (points.length < 2) return 0;
+
+      const dx = points[0].x - points[1].x;
+      const dy = points[0].y - points[1].y;
+
+      return Math.sqrt(dx * dx + dy * dy);
+
+    }
+
+    // 두 손가락 중간점 (화면 좌표)
+    function getPinchMidpoint() {
+
+      const points = Array.from(activePointers.values());
+
+      if (points.length < 2) return null;
+
+      return {
+        x: (points[0].x + points[1].x) / 2,
+        y: (points[0].y + points[1].y) / 2
+      };
+
+    }
+
+    // 화면 좌표 -> 마커 
+    // 카메라 광선이 마커와 만나는 지점을 사용합니다.
+    const dragRaycaster = new THREE.Raycaster();
+    const dragPlane = new THREE.Plane();
+    const dragNdc = new THREE.Vector2();
+    const dragPlaneNormal = new THREE.Vector3();
+    const dragPlanePoint = new THREE.Vector3();
+    const dragHitPoint = new THREE.Vector3();
+
+    // 화면 좌표에서 카메라 광선 생성
+    function setRayFromScreen(clientX, clientY) {
+
+      const rect = renderer.domElement.getBoundingClientRect();
+
+      if (!rect.width || !rect.height) return false;
+
+      dragNdc.set(
+        ((clientX - rect.left) / rect.width) * 2 - 1,
+        -((clientY - rect.top) / rect.height) * 2 + 1
+      );
+
+      camera.updateMatrixWorld();
+      camera.projectionMatrixInverse
+        .copy(camera.projectionMatrix)
+        .invert();
+
+      dragRaycaster.setFromCamera(dragNdc, camera);
+
+      anchor.group.updateMatrixWorld(true);
+
+      return true;
+
+    }
+
+    function screenToAnchorLocal(clientX, clientY, out, depth = 0) {
+
+      if (!setRayFromScreen(clientX, clientY)) return false;
+
+      dragPlaneNormal
+        .set(0, 0, 1)
+        .transformDirection(anchor.group.matrixWorld);
+
+      dragPlanePoint.set(0, 0, depth).applyMatrix4(anchor.group.matrixWorld);
+
+      dragPlane.setFromNormalAndCoplanarPoint(
+        dragPlaneNormal,
+        dragPlanePoint
+      );
+
+      if (!dragRaycaster.ray.intersectPlane(dragPlane, dragHitPoint)) {
+        return false;
+      }
+
+      out.copy(dragHitPoint);
+      anchor.group.worldToLocal(out);
+
+      return true;
+
+    }
+
+    const cameraInAnchor = new THREE.Vector3();
+    const phoneFacing = new THREE.Matrix4();
+    const phoneUp = new THREE.Vector3(0, 1, 0);
+
+    function placePhoneInView() {
+      const rect = renderer.domElement.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      anchor.group.updateMatrixWorld(true);
+      camera.getWorldPosition(cameraInAnchor);
+      anchor.group.worldToLocal(cameraInAnchor);
+      if (cameraInAnchor.z <= 0) return;
+
+      const depth = Math.min(0.90, cameraInAnchor.z * 0.34);
+      if (!screenToAnchorLocal(rect.left + rect.width / 2, rect.top + rect.height / 2, modelMoveGroup.position, depth)) return;
+      phoneFacing.lookAt(cameraInAnchor, modelMoveGroup.position, phoneUp);
+      modelMoveGroup.quaternion.setFromRotationMatrix(phoneFacing);
+      phonePlaced = true;
+    }
+
+    function ringPhone() {
+      ringStartedAt = performance.now();
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) return;
+      audioContext ||= new AudioContext();
+      audioContext.resume().then(() => {
+        const start = audioContext.currentTime + 0.012;
+        for (const delay of [0, 0.38]) {
+          const begin = start + delay;
+          for (const frequency of [1250, 1720]) {
+            const bell = audioContext.createOscillator();
+            const envelope = audioContext.createGain();
+            bell.frequency.value = frequency;
+            envelope.gain.setValueAtTime(0.001, begin);
+            envelope.gain.exponentialRampToValueAtTime(0.085, begin + 0.012);
+            envelope.gain.exponentialRampToValueAtTime(0.001, begin + 0.27);
+            bell.connect(envelope).connect(audioContext.destination);
+            bell.start(begin);
+            bell.stop(begin + 0.28);
+          }
+        }
+      }).catch(() => {});
+    }
+
+    function bindHandset(model) {
+      let positions;
+      let normals;
+      model.traverse((part) => {
+        const position = part.geometry?.getAttribute("position");
+        const normal = part.geometry?.getAttribute("normal");
+        if (!part.isMesh || position?.count !== 39801 || normal?.count !== 39801) return;
+        if (
+          Math.abs(position.getX(32932) + 0.0477411) > 0.00001 ||
+          Math.abs(position.getY(32932) - 0.0542156) > 0.00001 ||
+          Math.abs(position.getZ(32932) - 0.0936993) > 0.00001
+        ) return;
+        positions = position;
+        normals = normal;
+      });
+      if (!positions || !normals) return null;
+
+      const vertices = [];
+      for (const [ranges, fixedWeight] of [[HANDSET_RANGES, true], [CORD_RANGES, false]]) {
+        for (const [first, last] of ranges) {
+          for (let index = first; index <= last; index++) {
+            const y = positions.getY(index);
+            vertices.push({
+              index,
+              x: positions.getX(index),
+              y,
+              z: positions.getZ(index),
+              nx: normals.getX(index),
+              ny: normals.getY(index),
+              nz: normals.getZ(index),
+              weight: fixedWeight ? 1 : THREE.MathUtils.smoothstep(y, -0.05, 0.006)
+            });
+          }
+        }
+      }
+      return { positions, normals, vertices };
+    }
+
+    function deformHandset(angle, lift) {
+      const { positions, normals, vertices } = handsetRig;
+      const centerY = 0.043;
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      for (const { index, x, y, z, nx, ny, nz, weight } of vertices) {
+        const dy = y - centerY;
+        positions.setXYZ(index, x, y + weight * (dy * (cos - 1) - z * sin + lift),
+          z + weight * (dy * sin + z * (cos - 1)));
+        const newNY = ny + weight * (ny * (cos - 1) - nz * sin);
+        const newNZ = nz + weight * (ny * sin + nz * (cos - 1));
+        const length = Math.hypot(nx, newNY, newNZ) || 1;
+        normals.setXYZ(index, nx / length, newNY / length, newNZ / length);
+      }
+      positions.needsUpdate = true;
+      normals.needsUpdate = true;
+    }
+
+    function updatePhoneShake(now) {
+      const elapsed = (now - ringStartedAt) / 1000;
+      const pulse = elapsed % 0.38;
+      const strength = elapsed >= 0 && elapsed < 0.76 && pulse < 0.30
+        ? Math.sin(Math.PI * pulse / 0.30) : 0;
+      const shake = strength ? Math.sin(elapsed * Math.PI * 34) * strength : 0;
+      if (handsetRig) {
+        if (strength || handsetDeformed) {
+          deformHandset(shake * 0.095, strength * 0.003);
+          handsetDeformed = !!strength;
+        }
+      } else {
+        phoneShakeGroup.rotation.z = shake * 0.055;
+        phoneShakeGroup.position.x = shake * 0.012;
+      }
+    }
+
+    // 두 손가락 이동 상태
+    const dragPrevLocal = new THREE.Vector3();
+    const dragCurrLocal = new THREE.Vector3();
+    let dragHasPrev = false;
+    let dragTargetGroup = null;
+
+    // 전화기가 가리고 있는 곳에서는 전화기를 먼저 조작합니다.
+    function pickTargetAtPoint(clientX, clientY) {
+
+      if (!setRayFromScreen(clientX, clientY)) return null;
+
+      if (modelRoot) {
+
+        const modelHits = dragRaycaster.intersectObject(
+          modelMoveGroup,
+          true
+        );
+
+        if (modelHits.length > 0) return "model";
+
+      }
+
+      if (backgroundMesh?.visible) {
+
+        const backgroundHits = dragRaycaster.intersectObject(
+          backgroundMesh,
+          false
+        );
+
+        if (backgroundHits.length > 0) return "background";
+
+      }
+
+      return null;
+
+    }
+
+    // 두 손가락이 "모두" 같은 대상 위에 있을 때만 그 대상 반환
+    // 한 손가락씩 서로 다른 대상 위이거나, 하나라도 대상 밖이면 이동 안 함
+    function pickDragTarget() {
+
+      const points = Array.from(activePointers.values());
+
+      if (points.length < 2) return null;
+
+      const first = pickTargetAtPoint(points[0].x, points[0].y);
+      const second = pickTargetAtPoint(points[1].x, points[1].y);
+
+      if (!first || first !== second) return null;
+
+      if (first === "model") return modelMoveGroup;
+
+      return backgroundMoveGroup;
+
+    }
+
+    touchArea.addEventListener("pointerdown", (e) => {
+
+      // 전화기가 아직 로딩 중에도 영상은 조작할 수 있습니다.
+      if (!targetVisible) return;
+
+      e.preventDefault();
+
+      activePointers.set(e.pointerId, {
+        x: e.clientX,
+        y: e.clientY
+      });
+
+      touchArea.setPointerCapture(e.pointerId);
+
+      if (activePointers.size === 1) {
+
+        previousX = e.clientX;
+        previousY = e.clientY;
+
+        // 터치 시작 지점의 대상 판별 및 탭 판정 시작
+        singleStartTarget = pickTargetAtPoint(e.clientX, e.clientY);
+
+        tapCandidate = true;
+        tapStartX = e.clientX;
+        tapStartY = e.clientY;
+        tapStartTime = performance.now();
+
+      }
+
+      if (activePointers.size === 2) {
+
+        // 핀치 제스처는 전화기 탭으로 처리하지 않습니다.
+        singleStartTarget = null;
+        tapCandidate = false;
+
+        pinchStartDistance = getPinchDistance();
+
+        // 두 손가락 이동 시작 기준점
+        const mid = getPinchMidpoint();
+
+        // 두 손가락이 닿은 대상 판별 후, 대상이 있을 때만 이동 기준점 설정
+        dragTargetGroup = pickDragTarget();
+
+        // 핀치 시작 크기: 선택된 대상의 현재 크기
+        if (dragTargetGroup === modelMoveGroup && modelRoot) {
+          pinchStartScale = modelRoot.scale.x;
+        } else if (dragTargetGroup === backgroundMoveGroup) {
+          pinchStartScale = backgroundMoveGroup.scale.x;
+        } else {
+          pinchStartScale = 1;
+        }
+
+        dragHasPrev = (mid && dragTargetGroup)
+          ? screenToAnchorLocal(mid.x, mid.y, dragPrevLocal, dragTargetGroup.position.z)
+          : false;
+
+      }
+
+    });
+
+    touchArea.addEventListener("pointermove", (e) => {
+
+      if (!activePointers.has(e.pointerId)) return;
+
+      e.preventDefault();
+
+      activePointers.set(e.pointerId, {
+        x: e.clientX,
+        y: e.clientY
+      });
+
+      // 한 손가락으로 전화기를 돌립니다.
+      if (activePointers.size === 1) {
+
+        // 일정 거리 이상 움직이면 탭이 아님
+        if (tapCandidate) {
+
+          const movedX = e.clientX - tapStartX;
+          const movedY = e.clientY - tapStartY;
+
+          if (Math.sqrt(movedX * movedX + movedY * movedY) > TAP_MOVE_LIMIT) {
+            tapCandidate = false;
+          }
+
+        }
+
+        if (singleStartTarget === "model" && modelRoot && !tapCandidate) {
+
+          const deltaX = e.clientX - previousX;
+          const deltaY = e.clientY - previousY;
+
+          modelRoot.rotation.y += deltaX * ROTATION_SPEED;
+          modelRoot.rotation.x += deltaY * ROTATION_SPEED;
+
+          previousX = e.clientX;
+          previousY = e.clientY;
+
+        }
+
+      }
+
+      // 두 손가락: 확대 / 축소 + 위치 이동
+      else if (activePointers.size === 2) {
+
+        // 확대 / 축소
+        if (dragTargetGroup && pinchStartDistance > 0) {
+
+          const currentDistance = getPinchDistance();
+
+          const scaleRatio = currentDistance / pinchStartDistance;
+
+          const newScale = pinchStartScale * scaleRatio;
+
+          if (dragTargetGroup === modelMoveGroup && modelRoot) {
+
+            // 오브젝트: 기존과 동일한 범위
+            const clampedScale = THREE.MathUtils.clamp(
+              newScale,
+              initialFitScale * 0.1,
+              initialFitScale * 10
+            );
+
+            modelRoot.scale.setScalar(clampedScale);
+
+          } else if (dragTargetGroup === backgroundMoveGroup) {
+
+            // 영상: 초기 크기(1) 기준 
+            const clampedScale = THREE.MathUtils.clamp(
+              newScale,
+              0.1,
+              10
+            );
+
+            backgroundMoveGroup.scale.setScalar(clampedScale);
+
+          }
+
+        }
+
+        // 위치 이동: 두 손가락 중간점이 움직인 만큼, 처음 닿은 대상만 이동
+        const mid = getPinchMidpoint();
+
+        if (mid && dragTargetGroup) {
+
+          if (!dragHasPrev) {
+
+            dragHasPrev = screenToAnchorLocal(mid.x, mid.y, dragPrevLocal, dragTargetGroup.position.z);
+
+          } else if (screenToAnchorLocal(mid.x, mid.y, dragCurrLocal, dragTargetGroup.position.z)) {
+
+            dragTargetGroup.position.x += dragCurrLocal.x - dragPrevLocal.x;
+            dragTargetGroup.position.y += dragCurrLocal.y - dragPrevLocal.y;
+
+            dragPrevLocal.copy(dragCurrLocal);
+
+          }
+
+        }
+
+      }
+
+    });
+
+    function stopPointer(e) {
+
+      if (!activePointers.has(e.pointerId)) return;
+
+      // 짧게 전화기를 탭하면 벨이 울립니다.
+      if (
+        e.type === "pointerup" &&
+        activePointers.size === 1 &&
+        tapCandidate &&
+        targetVisible &&
+        singleStartTarget === "model" &&
+        Math.hypot(e.clientX - tapStartX, e.clientY - tapStartY) <= TAP_MOVE_LIMIT &&
+        performance.now() - tapStartTime < TAP_MAX_TIME
+      ) {
+        ringPhone();
+      }
+
+      tapCandidate = false;
+      singleStartTarget = null;
+
+      activePointers.delete(e.pointerId);
+
+      // 두 손가락 상태가 끝나면 이동 기준점 및 대상 해제
+      dragHasPrev = false;
+      dragTargetGroup = null;
+
+      // 손가락을 떼면 상단 상태 문구 원복
+      updateStatus();
+
+      if (activePointers.size === 1) {
+
+        const remaining = Array.from(activePointers.values())[0];
+
+        previousX = remaining.x;
+        previousY = remaining.y;
+
+      } else if (activePointers.size === 0) {
+
+        pinchStartDistance = 0;
+
+      }
+
+    }
+
+    touchArea.addEventListener("pointerup", stopPointer);
+    touchArea.addEventListener("pointercancel", stopPointer);
+    touchArea.addEventListener("lostpointercapture", stopPointer);
+
+    startAR();
+
+  </script>
+
+</body>
+</html>
