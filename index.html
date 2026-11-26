@@ -43,11 +43,11 @@
       transition: opacity 180ms ease;
     }
 
-    #container[data-tracking] #cameraShade { opacity: 0.70; }
+    #container[data-tracking] #cameraShade { opacity: 0.82; }
 
     #dialogue {
       position: fixed;
-      top: max(74px, 16dvh, calc(env(safe-area-inset-top) + 54px));
+      top: max(100px, 24dvh, calc(env(safe-area-inset-top) + 62px));
       left: 50%;
       width: min(calc(100% - 28px), 620px);
       transform: translateX(-50%);
@@ -236,8 +236,7 @@
     let videoReady = false;
     let videoFailed = false;
     let clockPlaybackAttempt = 0;
-    let clockAudioPrimed = false;
-    let clockAudioPriming = false;
+
     let backgroundMesh = null;
     let targetVisible = false;
     let started = false;
@@ -316,7 +315,8 @@
 
     function playBackgroundVideo(unmute = false) {
       if (!targetVisible || !videoReady || videoFailed) return;
-      if (unmute) video.muted = false;
+      if (clockSilentDuringCall()) video.muted = true;
+      else if (unmute) video.muted = false;
       const attempt = ++clockPlaybackAttempt;
       video.play().catch((error) => {
         if (attempt !== clockPlaybackAttempt || !targetVisible) return;
@@ -353,23 +353,12 @@
       if (backgroundMesh) backgroundMesh.visible = false;
       updateStatus();
     });
+    function clockSilentDuringCall() {
+      return phoneState === "answering" || phoneState === "returning";
+    }
+
     function enableClockAudioFromGesture() {
-      if (targetVisible && videoReady) {
-        if (video.muted) playBackgroundVideo(true);
-        return;
-      }
-      if (videoFailed || clockAudioPrimed || clockAudioPriming) return;
-      clockAudioPriming = true;
-      video.muted = false;
-      video.play().then(() => {
-        clockAudioPrimed = true;
-        if (!targetVisible) {
-          video.pause();
-          video.currentTime = 0;
-        }
-      }).catch(() => {}).finally(() => {
-        clockAudioPriming = false;
-      });
+      if (targetVisible && video.muted && !clockSilentDuringCall()) playBackgroundVideo(true);
     }
 
     document.addEventListener("pointerup", enableClockAudioFromGesture, { capture: true });
@@ -486,7 +475,7 @@
         starting = false;
 
         renderer.setAnimationLoop((now) => {
-          if (targetVisible && !phonePlaced) placePhoneInView();
+          if (targetVisible && modelRoot && !phonePlaced) placePhoneInView();
           updatePhoneMotion(now);
           updateCaptions(now);
           renderer.render(scene, camera);
@@ -507,7 +496,29 @@
 
     }
 
-    startButton.addEventListener("click", startAR);
+    async function unlockClockAndStart(showStartIfBlocked) {
+      video.muted = false;
+      // 틱 사이의 조용한 구간에서 재생 권한을 확인합니다.
+      video.currentTime = 0.25;
+      try {
+        await video.play();
+        video.pause();
+        video.currentTime = 0;
+      } catch (error) {
+        if (showStartIfBlocked && error.name === "NotAllowedError") {
+          status.textContent = "카메라를 시작해주세요";
+          startButton.style.display = "block";
+          return;
+        }
+      }
+      startAR();
+    }
+
+    startButton.addEventListener("click", () => {
+      if (started || starting) return;
+      startButton.style.display = "none";
+      unlockClockAndStart(false);
+    });
 
 
     // 한 손가락 회전
@@ -624,6 +635,27 @@
     const phoneFacing = new THREE.Matrix4();
     const phoneUp = new THREE.Vector3(0, 1, 0);
 
+    function phoneScreenBounds() {
+      const projected = new THREE.Vector3();
+      const matrix = new THREE.Matrix4();
+      const bounds = new THREE.Box2();
+      modelMoveGroup.updateWorldMatrix(true, true);
+      modelRoot.traverse((part) => {
+        if (!part.isMesh) return;
+        const positions = part.geometry.getAttribute("position");
+        matrix.multiplyMatrices(camera.matrixWorldInverse, part.matrixWorld);
+        matrix.premultiply(camera.projectionMatrix);
+        for (let index = 0; index < positions.count; index += 5) {
+          projected.fromBufferAttribute(positions, index).applyMatrix4(matrix);
+          bounds.min.x = Math.min(bounds.min.x, projected.x);
+          bounds.min.y = Math.min(bounds.min.y, projected.y);
+          bounds.max.x = Math.max(bounds.max.x, projected.x);
+          bounds.max.y = Math.max(bounds.max.y, projected.y);
+        }
+      });
+      return bounds;
+    }
+
     function placePhoneInView() {
       const rect = renderer.domElement.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
@@ -632,17 +664,40 @@
       anchor.group.worldToLocal(cameraInAnchor);
       if (cameraInAnchor.z <= 0) return;
 
-      const depth = Math.min(1.34, cameraInAnchor.z * 0.45);
-      if (!screenToAnchorLocal(rect.left + rect.width / 2, rect.top + rect.height * 0.63, modelMoveGroup.position, depth)) return;
-      modelMoveGroup.position.x = THREE.MathUtils.clamp(modelMoveGroup.position.x, -0.24, 0.24);
-      modelMoveGroup.position.y = THREE.MathUtils.clamp(modelMoveGroup.position.y, -0.43, -0.13);
+      const depth = cameraInAnchor.z * 0.72;
+      const targetY = -0.63;
+      const screenX = rect.left + rect.width / 2;
+      const screenY = rect.top + (1 - targetY) * rect.height / 2;
+      if (!screenToAnchorLocal(screenX, screenY, modelMoveGroup.position, depth)) return;
       phoneFacing.lookAt(cameraInAnchor, modelMoveGroup.position, phoneUp);
       modelMoveGroup.quaternion.setFromRotationMatrix(phoneFacing);
+      // 시작 스케일은 거리에도 비례시켜 처음부터 화면 밖으로 튀는 것을 피합니다.
+      modelRoot.scale.setScalar(initialFitScale * Math.min(1, cameraInAnchor.z * 0.25));
+
+      const size = new THREE.Vector2();
+      const center = new THREE.Vector2();
+      for (let step = 0; step < 3; step++) {
+        const bounds = phoneScreenBounds();
+        bounds.getSize(size);
+        if (size.x <= 0 || size.y <= 0) return;
+        const ratio = Math.min(1.76 / size.x, 0.60 / size.y);
+        modelRoot.scale.multiplyScalar(ratio);
+        phoneScreenBounds().getCenter(center);
+        screenToAnchorLocal(screenX - center.x * rect.width / 2,
+          screenY + (center.y - targetY) * rect.height / 2,
+          modelMoveGroup.position, depth);
+        phoneFacing.lookAt(cameraInAnchor, modelMoveGroup.position, phoneUp);
+        modelMoveGroup.quaternion.setFromRotationMatrix(phoneFacing);
+      }
+      initialFitScale = modelRoot.scale.x;
       phonePlaced = true;
     }
 
     function setPhoneState(state) {
+      const wasQuiet = clockSilentDuringCall();
       phoneState = state;
+      if (clockSilentDuringCall()) video.muted = true;
+      else if (wasQuiet) playBackgroundVideo(true);
       phoneStateStartedAt = performance.now();
       updateStatus();
     }
@@ -1030,7 +1085,7 @@
     touchArea.addEventListener("pointercancel", stopPointer);
     touchArea.addEventListener("lostpointercapture", stopPointer);
 
-    startAR();
+    unlockClockAndStart(true);
 
   </script>
 
