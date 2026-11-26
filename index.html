@@ -691,7 +691,9 @@
 
       const depth = cameraInAnchor.z * 0.72;
       const screenX = rect.left + rect.width / 2;
-      const screenY = rect.top + rect.height / 2;
+      // 하단 3분의 1의 중앙에 두고, 위아래 가장자리에 여백을 둡니다.
+      const targetY = -2 / 3;
+      const screenY = rect.top + (1 - targetY) * rect.height / 2;
       if (!screenToAnchorLocal(screenX, screenY, modelMoveGroup.position, depth, phoneAnchor)) return;
       phoneFacing.lookAt(cameraInAnchor, modelMoveGroup.position, phoneUp);
       modelMoveGroup.quaternion.setFromRotationMatrix(phoneFacing);
@@ -704,11 +706,11 @@
         const bounds = phoneScreenBounds();
         bounds.getSize(size);
         if (size.x <= 0 || size.y <= 0) return;
-        const ratio = Math.min(1.84 / size.x, 0.82 / size.y);
+        const ratio = Math.min(1.84 / size.x, 0.52 / size.y);
         modelRoot.scale.multiplyScalar(ratio);
         phoneScreenBounds().getCenter(center);
         screenToAnchorLocal(screenX - center.x * rect.width / 2,
-          screenY + center.y * rect.height / 2,
+          screenY + (center.y - targetY) * rect.height / 2,
           modelMoveGroup.position, depth, phoneAnchor);
         phoneFacing.lookAt(cameraInAnchor, modelMoveGroup.position, phoneUp);
         modelMoveGroup.quaternion.setFromRotationMatrix(phoneFacing);
