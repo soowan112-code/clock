@@ -43,11 +43,11 @@
       transition: opacity 180ms ease;
     }
 
-    #container[data-tracking] #cameraShade { opacity: 0.55; }
+    #container[data-tracking] #cameraShade { opacity: 0.70; }
 
     #dialogue {
       position: fixed;
-      top: calc(max(16px, env(safe-area-inset-top)) + 20px);
+      top: max(74px, 16dvh, calc(env(safe-area-inset-top) + 54px));
       left: 50%;
       width: min(calc(100% - 28px), 620px);
       transform: translateX(-50%);
@@ -76,7 +76,7 @@
 
     #status {
       position: fixed;
-      top: calc(max(12px, env(safe-area-inset-top)) + 10px);
+      top: calc(max(12px, env(safe-area-inset-top)) + 34px);
       left: 50%;
       transform: translateX(-50%);
       z-index: 10;
@@ -111,6 +111,20 @@
       font-size: 17px;
     }
 
+    #soundNotice {
+      position: fixed;
+      top: max(12px, env(safe-area-inset-top));
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 16;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+      text-shadow: 0 1px 5px #000, 0 0 8px #000;
+      pointer-events: none;
+    }
+
     #answerButton {
       position: fixed;
       left: 50%;
@@ -135,6 +149,7 @@
   <div id="container"><div id="cameraShade" aria-hidden="true"></div></div>
   <div id="touchArea"></div>
 
+  <div id="soundNotice">소리를 켜주세요</div>
   <div id="status" role="status">AR 준비 중...</div>
 
   <button id="startButton">카메라 시작</button>
@@ -197,7 +212,7 @@
     const POSTER_WIDTH = 1054;
     const POSTER_HEIGHT = 1492;
     const TARGET_HEIGHT = 1364;
-    const PHONE_SIZE = 0.46;
+    const PHONE_SIZE = 0.50;
     const RECEIVER_LIFT = 0.11;
     const RECEIVER_REACH = 0.035;
     const RECEIVER_TILT = 0.16;
@@ -221,6 +236,8 @@
     let videoReady = false;
     let videoFailed = false;
     let clockPlaybackAttempt = 0;
+    let clockAudioPrimed = false;
+    let clockAudioPriming = false;
     let backgroundMesh = null;
     let targetVisible = false;
     let started = false;
@@ -291,9 +308,7 @@
       } else if (videoFailed || modelFailed) {
         status.textContent = videoFailed ? "시계 영상을 불러올 수 없어요" : "전화기 모델을 불러올 수 없어요";
       } else {
-        status.textContent = phoneState === "ringing"
-          ? "전화기를 한 번 더 누르면 벨이 멈춰요"
-          : phoneState === "idle" && modelRoot ? "전화기를 툭 쳐보세요" : "";
+        status.textContent = phoneState === "idle" && modelRoot ? "전화기를 터치하세요" : "";
       }
       status.hidden = !status.textContent;
       answerButton.hidden = !targetVisible || phoneState !== "ringing" || !handsetRig;
@@ -338,9 +353,27 @@
       if (backgroundMesh) backgroundMesh.visible = false;
       updateStatus();
     });
-    document.addEventListener("pointerup", () => {
-      if (video.muted) playBackgroundVideo(true);
-    }, { capture: true });
+    function enableClockAudioFromGesture() {
+      if (targetVisible && videoReady) {
+        if (video.muted) playBackgroundVideo(true);
+        return;
+      }
+      if (videoFailed || clockAudioPrimed || clockAudioPriming) return;
+      clockAudioPriming = true;
+      video.muted = false;
+      video.play().then(() => {
+        clockAudioPrimed = true;
+        if (!targetVisible) {
+          video.pause();
+          video.currentTime = 0;
+        }
+      }).catch(() => {}).finally(() => {
+        clockAudioPriming = false;
+      });
+    }
+
+    document.addEventListener("pointerup", enableClockAudioFromGesture, { capture: true });
+    document.addEventListener("keydown", enableClockAudioFromGesture);
     video.load();
 
     // GLB 3D 모델 로딩
@@ -415,7 +448,7 @@
     anchor.onTargetFound = () => {
       targetVisible = true;
       container.setAttribute("data-tracking", "");
-      playBackgroundVideo();
+      playBackgroundVideo(true);
       updateStatus();
     };
 
@@ -619,15 +652,11 @@
       ringAudio.currentTime = 0;
     }
 
-    function toggleRing() {
-      if (phoneState === "ringing") {
-        stopBell();
-        setPhoneState("idle");
-      } else if (phoneState === "idle") {
-        ringAudio.currentTime = 0;
-        setPhoneState("ringing");
-        ringAudio.play().catch(() => {});
-      }
+    function startBell() {
+      if (phoneState !== "idle") return;
+      ringAudio.currentTime = 0;
+      setPhoneState("ringing");
+      ringAudio.play().catch(() => {});
     }
 
     function answerPhone() {
@@ -785,7 +814,7 @@
       if (points.length < 2) return null;
       const first = pickTargetAtPoint(points[0].x, points[0].y);
       const second = pickTargetAtPoint(points[1].x, points[1].y);
-      if (first === "model" || (!first && second === "model")) return modelMoveGroup;
+      if (first === "model" || second === "model") return modelMoveGroup;
       if (first === "background" && second === "background") return backgroundMoveGroup;
       return null;
     }
@@ -967,7 +996,7 @@
         Math.hypot(e.clientX - tapStartX, e.clientY - tapStartY) <= TAP_MOVE_LIMIT &&
         performance.now() - tapStartTime < TAP_MAX_TIME
       ) {
-        toggleRing();
+        startBell();
       }
 
       tapCandidate = false;
