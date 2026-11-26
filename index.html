@@ -691,8 +691,9 @@
 
       const depth = cameraInAnchor.z * 0.72;
       const screenX = rect.left + rect.width / 2;
-      // 하단 3분의 1의 중앙에 두고, 위아래 가장자리에 여백을 둡니다.
-      const targetY = -2 / 3;
+      // 초기 위치는 화면 아래쪽에 맞추고, 전화기 밑에 화면 높이의 1.5%를 남깁니다.
+      const bottomEdge = -0.97;
+      const targetY = bottomEdge + 0.52 / 2;
       const screenY = rect.top + (1 - targetY) * rect.height / 2;
       if (!screenToAnchorLocal(screenX, screenY, modelMoveGroup.position, depth, phoneAnchor)) return;
       phoneFacing.lookAt(cameraInAnchor, modelMoveGroup.position, phoneUp);
@@ -702,15 +703,18 @@
 
       const size = new THREE.Vector2();
       const center = new THREE.Vector2();
-      for (let step = 0; step < 3; step++) {
+      const projectedOrigin = new THREE.Vector3();
+      for (let step = 0; step < 4; step++) {
         const bounds = phoneScreenBounds();
         bounds.getSize(size);
         if (size.x <= 0 || size.y <= 0) return;
         const ratio = Math.min(1.84 / size.x, 0.52 / size.y);
         modelRoot.scale.multiplyScalar(ratio);
-        phoneScreenBounds().getCenter(center);
-        screenToAnchorLocal(screenX - center.x * rect.width / 2,
-          screenY + (center.y - targetY) * rect.height / 2,
+        const fittedBounds = phoneScreenBounds();
+        fittedBounds.getCenter(center);
+        modelMoveGroup.getWorldPosition(projectedOrigin).project(camera);
+        screenToAnchorLocal(rect.left + (1 + projectedOrigin.x - center.x) * rect.width / 2,
+          rect.top + (1 - projectedOrigin.y + fittedBounds.min.y - bottomEdge) * rect.height / 2,
           modelMoveGroup.position, depth, phoneAnchor);
         phoneFacing.lookAt(cameraInAnchor, modelMoveGroup.position, phoneUp);
         modelMoveGroup.quaternion.setFromRotationMatrix(phoneFacing);
